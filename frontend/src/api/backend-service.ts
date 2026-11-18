@@ -106,3 +106,106 @@ export async function loadRecoveryStats(): Promise<Record<string, unknown>> {
   if (!response.ok) throw new Error('恢复状态查询失败')
   return await response.json()
 }
+
+// ---- 页面模型工作台：源端配置版本 ----
+
+export type SourceConfigSnapshotRow = {
+  snapshot_id: number
+  snapshot_ref: string
+  processing_item: string
+  model_id: number
+  model_name: string
+  target_site: string
+  model_version: string
+  snapshot_version: string
+  page_structure: string
+  inferred_fields: string[]
+  field_mapping: {
+    field: string
+    source_path: string
+    target_field: string
+    data_type: string
+    inferred: boolean
+  }[]
+  status: string
+  terminal_state: number
+  terminal_state_label: string
+  created_at: string
+  bound_batches: string[]
+  conflict_batches: string[]
+  accepting_new_batches: boolean
+}
+
+export type BatchBindingRow = {
+  batch_ref: string
+  site: string
+  model_id: number
+  model_version: string
+  snapshot_id: number
+  snapshot_ref: string
+  snapshot_version: string
+  processing_item: string
+  terminal_state: number
+  terminal_state_label: string
+  batch_status: string | null
+  todo: string | null
+  field_mapping: {
+    field: string
+    source_path: string
+    target_field: string
+    data_type: string
+    inferred: boolean
+    rule_name: string
+  }[]
+}
+
+export type SnapshotPage = {
+  items: SourceConfigSnapshotRow[]
+  total: number
+  page: number
+  size: number
+}
+
+export async function listSourceConfigs(
+  filters: { site?: string; version?: string; status?: string; keyword?: string },
+  page = 1,
+  size = 20,
+): Promise<SnapshotPage> {
+  const query = new URLSearchParams()
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) query.set(key, value)
+  })
+  query.set('page', String(page))
+  query.set('size', String(size))
+  const response = await request(`/api/source-configs?${query.toString()}`)
+  if (!response.ok) throw new Error('配置版本读取失败')
+  return await response.json()
+}
+
+export async function listBatchBindings(
+  filters: { site?: string; version?: string },
+  page = 1,
+  size = 20,
+): Promise<{ items: BatchBindingRow[]; total: number; page: number; size: number }> {
+  const query = new URLSearchParams()
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) query.set(key, value)
+  })
+  query.set('page', String(page))
+  query.set('size', String(size))
+  const response = await request(`/api/source-configs/bindings?${query.toString()}`)
+  if (!response.ok) throw new Error('批次配置绑定读取失败')
+  return await response.json()
+}
+
+export async function resolveConfigConflict(
+  batchRef: string,
+  strategy: 'continue' | 'abort',
+): Promise<{ ok: boolean; message?: string; reused?: boolean }> {
+  const response = await request(
+    `/api/source-configs/conflicts/${encodeURIComponent(batchRef)}/resolve`,
+    { method: 'POST', body: JSON.stringify({ strategy }) },
+  )
+  return await response.json()
+}
+

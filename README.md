@@ -79,5 +79,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 页面模型配置版本化
+
+页面模型每次发布都会在 `store.source_configs` 冻结一个源端配置快照
+（`CFG-xxxx`，处理项7），快照包含模型字段、版本号、分页/加载策略、
+字段推断结果与字段映射口径。约束如下：
+
+- 采集批次与配置版本同时绑定，一个批次只能绑定一个版本；
+- 模型再次发布只冻结旧快照承接新批次的能力，不覆盖已开始批次的字段口径；
+- 数据提取按快照写入「字段映射采集明细」，采集记录/脏数据都带
+  `snapshot_id`、`snapshot_version`，历史明细可回溯；
+- 采集启动与首批写入之间模型再次发布时，可沿用旧快照（continue）或
+  中止并按新配置重启（abort），两种方式都只保留一个版本绑定，
+  冲突统一记录到页面源配置的 7 号处理终态；重复提交只保留一条结果；
+- 台账支持按站点名称、版本筛选，按创建顺序/时间/站点/版本/绑定批次数排序分页；
+- 批次待办、台账与结果清单联动核对，`/api/source-configs/batch/{批次}` 可回溯。
+
+相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/source-configs` | 配置版本台账（site/version/status/sort/page） |
+| `GET /api/source-configs/bindings` | 批次与配置版本绑定核对 |
+| `GET /api/source-configs/batch/{batch_ref}` | 按批次回溯快照与字段映射明细 |
+| `GET /api/source-configs/conflicts` | 配置版本冲突记录 |
+| `POST /api/source-configs/conflicts/{batch_ref}/resolve` | `continue` / `abort` 处理冲突 |
+
+前端入口：侧栏「配置版本快照」或 `/page_model/configs`。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

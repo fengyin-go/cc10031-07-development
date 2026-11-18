@@ -5,7 +5,10 @@
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, Query
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -14,6 +17,14 @@ from app.store import store
 from app.services import runtime_session, callback_hook
 
 app = FastAPI(title="RPA流程自动化中心", version="1.0.0")
+
+
+@app.on_event("startup")
+def seed_config_snapshots() -> None:
+    """启动时为已使用的页面模型补登配置版本，保证工作台开箱有数据。"""
+    from app.services.page_model import ensure_seed_snapshots
+
+    ensure_seed_snapshots()
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +147,108 @@ def runtime_sessions() -> dict[str, object]:
     return {"count": len(sessions), "sessions": sessions}
 
 
+# ---- 源端配置版本化 API（页面模型工作台） ----
+
+@app.get("/api/source-configs")
+def list_source_configs(
+    site: str | None = Query(default=None),
+    version: str | None = Query(default=None),
+    model_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+    sort_by: str = Query(default="snapshot_id"),
+    sort_order: str = Query(default="desc"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+) -> dict[str, object]:
+    """页面模型工作台：按站点名称和版本查看配置版本快照。"""
+    from app.services import PageModelService
+
+    items, total = PageModelService().list_config_snapshots(
+        site=site, version=version, model_id=model_id, status=status,
+        keyword=keyword, sort_by=sort_by, sort_order=sort_order,
+        page=page, size=size,
+    )
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@app.get("/api/source-configs/bindings")
+def list_source_config_bindings(
+    site: str | None = Query(default=None),
+    version: str | None = Query(default=None),
+    model_id: int | None = Query(default=None),
+    batch_ref: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+) -> dict[str, object]:
+    """核对每个采集批次绑定的字段映射和配置快照。"""
+    from app.services import PageModelService
+
+    items, total = PageModelService().snapshot_batch_bindings(
+        site=site, version=version, model_id=model_id, batch_ref=batch_ref,
+        page=page, size=size,
+    )
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@app.get("/api/source-configs/conflicts")
+def list_source_config_conflicts(
+    batch_ref: str | None = Query(default=None),
+) -> dict[str, object]:
+    """配置版本冲突记录（统一落到页面源配置的 7 号处理终态）。"""
+    rows = store.source_configs.list_conflicts(batch_ref)
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/source-configs/batch/{batch_ref}")
+def batch_source_config(batch_ref: str) -> dict[str, object]:
+    """按批次回溯实际使用的配置快照、字段映射明细和结果清单。"""
+    from app.services import BatchTrackerService
+
+    tracker = BatchTrackerService()
+    return {
+        "batch_ref": batch_ref,
+        "binding": tracker.locate_snapshot(batch_ref),
+        "ledger_check": tracker.cross_check_ledger(batch_ref),
+        "mapping_details": store.source_configs.list_details(batch_ref=batch_ref),
+    }
+
+
+@app.post("/api/source-configs/conflicts/{batch_ref}/resolve")
+def resolve_source_config_conflict(batch_ref: str, payload: dict) -> dict[str, object]:
+    """处理采集启动后模型再次发布导致的版本冲突。
+
+    策略 continue（沿用旧快照）或 abort（中止并按新配置重启），
+    两种方式都只保留一个配置版本绑定，重复提交只保留一条结果。
+    """
+    from app.services import BatchTrackerService, DataExtractService
+
+    strategy = str(payload.get("strategy") or "").strip()
+    result = DataExtractService().resolve_version_conflict(batch_ref, strategy)
+    if result.get("ok"):
+        tracker = BatchTrackerService()
+        label = {
+            "continue": "沿用旧配置快照，待继续采集",
+            "abort": "已按新配置重启，待核对",
+        }.get(strategy)
+        if label:
+            tracker.update_todo(batch_ref, label)
+        result["ledger_check"] = tracker.cross_check_ledger(batch_ref)
+    return result
+
+
+@app.get("/api/source-configs/{snapshot_id}")
+def get_source_config(snapshot_id: int) -> dict[str, object]:
+    """单个配置版本快照详情（含字段映射与批次绑定）。"""
+    snapshot = store.source_configs.get(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"配置快照 {snapshot_id} 不存在")
+    payload = snapshot.as_dict()
+    payload["mapping_details"] = store.source_configs.list_details(
+        snapshot_id=snapshot_id)
+    return payload
+
+
 # ---- 跨模块数据流编排入口 ----
 
 @app.post("/api/pipeline/rpa-lifecycle")
@@ -191,10 +304,25 @@ def pipeline_rpa_lifecycle() -> dict[str, object]:
                     break
     results["source_configs_published"] = config_published
 
-    # 5. 执行数据采集
+    # 5. 执行数据采集（批次与配置版本同时绑定）
     extract_svc = DataExtractService()
     extract_result = extract_svc.consume_source_and_extract()
+    if not extract_result["batches"]:
+        # 幂等发布不会重复广播，直接按当前有效快照启动一个采集批次
+        for model in page_svc.list_active_models():
+            snapshot_id = extract_svc.active_snapshot_id(model["model_id"])
+            if snapshot_id is None:
+                continue
+            batch_ref = f"BATC-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-P{snapshot_id}"
+            direct = extract_svc.extract_batch(snapshot_id, batch_ref)
+            if direct.get("ok"):
+                extract_result["extracted"] += direct["extracted"]
+                extract_result["dirty"] += direct["dirty"]
+                extract_result["batches"].append(direct)
+            break
     results["data_extracted"] = extract_result
+    results["config_versions"] = len(store.source_configs.all())
+    results["mapping_details"] = len(store.source_configs.list_details())
 
     # 6. 校验采集结果
     verify_svc = ResultVerifyService()
